@@ -1,0 +1,84 @@
+name: 🪟 Windows double builds
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+concurrency:
+  group: windows-double-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GODOT_CPP_PATH: thirdparty/godot-cpp
+  LIB_NAME: libvoxel
+
+jobs:
+  build-windows-double:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target-type: [ editor, template_release ]
+        float-precision: [ double ]
+        arch: [ x86_64 ]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout GodotCpp
+        uses: actions/checkout@v4
+        with:
+          repository: godotengine/godot-cpp
+          ref: master
+          path: ${{ env.GODOT_CPP_PATH }}
+
+      - name: Setup godot-cpp (Windows)
+        uses: ./thirdparty/godot-cpp/.github/actions/setup-godot-cpp
+        with:
+          platform: windows
+          em-version: 3.1.62
+          windows-compiler: msvc
+          buildtool: scons
+
+      - name: Cache .scons_cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.scons-cache/
+          key: windows_${{ matrix.arch }}_${{ matrix.float-precision }}_${{ matrix.target-type }}_gdextension_cache
+
+      - name: Build (scons)
+        shell: bash
+        env:
+          SCONS_CACHE: ${{ github.workspace }}/.scons-cache/
+        run: |
+          scons target=${{ matrix.target-type }} platform=windows arch=${{ matrix.arch }} precision=${{ matrix.float-precision }} dev_build=no verbose=yes -j$(nproc || echo 2)
+
+      - name: Clean compilation files (windows)
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item project/addons/zylann.voxel/bin/* -Include *.exp,*.lib,*.pdb -Force -ErrorAction SilentlyContinue
+
+      - name: Print built files
+        shell: bash
+        run: |
+          echo "Artifacts in project/addons/zylann.voxel/bin"
+          ls -la project/addons/zylann.voxel/bin || true
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{env.LIB_NAME}}-windows-${{ matrix.arch }}-${{ matrix.float-precision }}-${{ matrix.target-type }}
+          path: |
+            ${{ github.workspace }}/project/addons/zylann.voxel/bin/**
+
+      - name: Smoke check built DLL
+        shell: bash
+        run: |
+          if ls project/addons/zylann.voxel/bin/*.dll 1>/dev/null 2>&1; then
+            echo "DLLs present:"; ls -la project/addons/zylann.voxel/bin/*.dll
+          else
+            echo "No DLL built!"; exit 1
+          fi
