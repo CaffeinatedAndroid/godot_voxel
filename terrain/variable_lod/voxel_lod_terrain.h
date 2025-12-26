@@ -13,6 +13,7 @@
 #include "shader_material_pool_vlt.h"
 #include "voxel_lod_terrain_update_data.h"
 #include "voxel_mesh_block_vlt.h"
+#include "../../util/godot/classes/array_mesh.h"
 
 #ifdef TOOLS_ENABLED
 #include "../../util/godot/debug_renderer.h"
@@ -340,6 +341,11 @@ private:
 
 	void save_all_modified_blocks(bool with_copy, std::shared_ptr<AsyncDependencyTracker> tracker);
 
+	// Save queue handling
+	void _enqueue_save_mesh_job(const SaveMeshJob &job);
+	void _process_save_mesh_jobs(TimeSpreadTaskContext &ctx);
+
+
 	void process_deferred_collision_updates(uint32_t timeout_msec);
 	void process_fading_blocks(float delta);
 
@@ -413,6 +419,21 @@ private:
 	float _collision_margin = constants::DEFAULT_COLLISION_MARGIN;
 	int _collision_update_delay = 0;
 	FixedArray<StdVector<Vector3i>, constants::MAX_LOD> _deferred_collision_updates_per_lod;
+
+	// Editor mesh saving
+	bool _save_meshes_in_editor = false;
+	String _save_meshes_path = String("res://voxel_chunk_meshes");
+	bool _save_meshes_overwrite = false;
+
+	struct SaveMeshJob {
+		Ref<ArrayMesh> mesh;
+		Transform3D transform;
+		String mesh_path;
+		String scene_path;
+	};
+
+	zylann::StdQueue<SaveMeshJob> _save_mesh_job_queue;
+	bool _save_mesh_task_scheduled = false;
 
 	float _lod_fade_duration = 0.f;
 	// Note, direct pointers to mesh blocks should be safe because these blocks are always destroyed from the same

@@ -1,4 +1,5 @@
 #include "voxel_terrain.h"
+#include "../../util/godot/file_utils.h"
 #include "../../constants/voxel_constants.h"
 #include "../../constants/voxel_string_names.h"
 #include "../../edition/voxel_tool_terrain.h"
@@ -20,6 +21,7 @@
 #include "../../util/godot/classes/multiplayer_api.h"
 #include "../../util/godot/classes/multiplayer_peer.h"
 #include "../../util/godot/classes/scene_tree.h"
+#include "../../util/godot/classes/packed_scene.h"
 #include "../../util/godot/classes/script.h"
 #include "../../util/godot/classes/shader_material.h"
 #include "../../util/godot/core/array.h"
@@ -1982,8 +1984,70 @@ void VoxelTerrain::process_meshing() {
 	// String::num(_block_update_queue.size()));
 }
 
+// Time-spread saving task for fixed LOD terrain
+struct SaveMeshesTimeSpreadTaskVT : public zylann::ITimeSpreadTask {
+	SaveMeshesTimeSpreadTaskVT(VoxelTerrain *p_parent) : parent(p_parent) {}
+	void run(TimeSpreadTaskContext &ctx) override { parent->_process_save_mesh_jobs(ctx); }
+	VoxelTerrain *parent;
+};
+
+void VoxelTerrain::_enqueue_save_mesh_job(const SaveMeshJob &job) {
+	_save_mesh_job_queue.push(job);
+	if (!_save_mesh_task_scheduled) {
+		_save_mesh_task_scheduled = true;
+		SaveMeshesTimeSpreadTaskVT *task = ZN_NEW(SaveMeshesTimeSpreadTaskVT)(this);
+		VoxelEngine::get_singleton().push_main_thread_time_spread_task(task);
+	}
+}
+
+void VoxelTerrain::_process_save_mesh_jobs(TimeSpreadTaskContext &ctx) {
+	const unsigned int MAX_PER_RUN = 2;
+	unsigned int processed = 0;
+
+	while (_save_mesh_job_queue.size() > 0 && processed < MAX_PER_RUN) {
+		const SaveMeshJob job = _save_mesh_job_queue.front();
+		_save_mesh_job_queue.pop();
+
+		const String mesh_dir = job.mesh_path.get_base_dir();
+		if (zylann::godot::check_directory_created(mesh_dir) == OK) {
+			if (_save_meshes_overwrite || !zylann::godot::open_directory(mesh_dir, nullptr).is_valid() ||
+				!zylann::godot::open_directory(mesh_dir, nullptr)->file_exists(job.mesh_path.get_file())) {
+				const Error save_err = zylann::godot::save_resource(job.mesh, job.mesh_path, ResourceSaver::FLAG_NONE);
+				if (save_err != OK) {
+					ZN_PRINT_ERROR(String("Failed to save mesh ") + job.mesh_path + String(" error: ") + String::num_int64(save_err));
+				}
+			}
+
+			Ref<PackedScene> scene;
+			scene.instantiate();
+			MeshInstance3D *mi = memnew(MeshInstance3D);
+			mi->set_mesh(job.mesh);
+			mi->set_transform(job.transform);
+			const Error pack_result = scene->pack(mi);
+			memdelete(mi);
+			if (pack_result == OK) {
+				const Error save_err = zylann::godot::save_resource(scene, job.scene_path, ResourceSaver::FLAG_NONE);
+				if (save_err != OK) {
+					ZN_PRINT_ERROR(String("Failed to save scene ") + job.scene_path + String(" error: ") + String::num_int64(save_err));
+				}
+			} else {
+				ZN_PRINT_ERROR(String("Failed to pack scene for ") + job.scene_path);
+			}
+		}
+
+		++processed;
+	}
+
+	if (_save_mesh_job_queue.size() > 0) {
+		ctx.postpone = true;
+	} else {
+		_save_mesh_task_scheduled = false;
+	}
+}
+
 void VoxelTerrain::apply_mesh_update(const VoxelEngine::BlockMeshOutput &ob) {
 	ZN_PROFILE_SCOPE();
+
 	// print_line(String("DDD receive {0}").format(varray(ob.position.to_vec3())));
 
 	VoxelMeshBlockVT *block = _mesh_map.get_block(ob.position);
@@ -2036,6 +2100,19 @@ void VoxelTerrain::apply_mesh_update(const VoxelEngine::BlockMeshOutput &ob) {
 			const unsigned int material_index = material_indices[surface_index];
 			Ref<Material> material = _mesher->get_material_by_index(material_index);
 			mesh->surface_set_material(surface_index, material);
+		}
+
+		// Enqueue mesh save when in editor and option enabled
+		if (Engine::get_singleton()->is_editor_hint() && _save_meshes_in_editor) {
+			SaveMeshJob job;
+			job.mesh = mesh;
+			const Vector3 local_pos = ob.position * get_mesh_block_size();
+			job.transform = get_global_transform() * Transform3D(Basis(), local_pos);
+			const String base_dir = _save_meshes_path;
+			const String lod_dir = base_dir.path_join("lod" + String::num_int64(ob.lod));
+			job.mesh_path = lod_dir.path_join(String("chunk_x{0}_y{1}_z{2}.tres").format(varray(ob.position.x, ob.position.y, ob.position.z)));
+			job.scene_path = lod_dir.path_join(String("chunk_x{0}_y{1}_z{2}.tscn").format(varray(ob.position.x, ob.position.y, ob.position.z)));
+			_enqueue_save_mesh_job(job);
 		}
 	}
 
@@ -2503,6 +2580,20 @@ void VoxelTerrain::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("set_run_stream_in_editor", "enable"), &Self::set_run_stream_in_editor);
 	ClassDB::bind_method(D_METHOD("is_stream_running_in_editor"), &Self::is_stream_running_in_editor);
+
+	// Save meshes in editor
+	ClassDB::bind_method(D_METHOD("set_save_meshes_in_editor", "enable"), &Self::set_save_meshes_in_editor);
+	ClassDB::bind_method(D_METHOD("is_saving_meshes_in_editor"), &Self::is_saving_meshes_in_editor);
+
+	ClassDB::bind_method(D_METHOD("set_save_meshes_path", "path"), &Self::set_save_meshes_path);
+	ClassDB::bind_method(D_METHOD("get_save_meshes_path"), &Self::get_save_meshes_path);
+
+	ClassDB::bind_method(D_METHOD("set_save_meshes_overwrite", "enable"), &Self::set_save_meshes_overwrite);
+	ClassDB::bind_method(D_METHOD("is_save_meshes_overwrite"), &Self::is_save_meshes_overwrite);
+
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "save_meshes_in_editor"), "set_save_meshes_in_editor", "is_saving_meshes_in_editor");
+	ADD_PROPERTY(PropertyInfo(Variant::STRING, "save_meshes_path", PROPERTY_HINT_DIR), "set_save_meshes_path", "get_save_meshes_path");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "save_meshes_overwrite"), "set_save_meshes_overwrite", "is_save_meshes_overwrite");
 
 	ClassDB::bind_method(D_METHOD("set_automatic_loading_enabled", "enable"), &Self::set_automatic_loading_enabled);
 	ClassDB::bind_method(D_METHOD("is_automatic_loading_enabled"), &Self::is_automatic_loading_enabled);

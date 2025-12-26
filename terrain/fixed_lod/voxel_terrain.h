@@ -13,6 +13,8 @@
 #include "../voxel_mesh_map.h"
 #include "../voxel_node.h"
 #include "voxel_mesh_block_vt.h"
+#include "../../util/godot/classes/array_mesh.h"
+#include "../../util/containers/std_queue.h"
 #include "voxel_terrain_multiplayer_synchronizer.h"
 
 #ifdef TOOLS_ENABLED
@@ -123,6 +125,16 @@ public:
 
 	void set_run_stream_in_editor(bool enable);
 	bool is_stream_running_in_editor() const;
+
+	// Save meshes generated in editor
+	void set_save_meshes_in_editor(bool enable);
+	bool is_saving_meshes_in_editor() const;
+
+	void set_save_meshes_path(const String &path);
+	String get_save_meshes_path() const;
+
+	void set_save_meshes_overwrite(bool enable);
+	bool is_save_meshes_overwrite() const;
 
 	void set_bounds(Box3i box);
 	Box3i get_bounds() const;

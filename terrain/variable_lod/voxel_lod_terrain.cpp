@@ -35,6 +35,8 @@
 #include "../free_mesh_task.h"
 #include "../voxel_save_completion_tracker.h"
 #include "voxel_lod_terrain_update_task.h"
+#include "../../util/godot/file_utils.h"
+#include "../../util/godot/classes/packed_scene.h"
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 #include "../../engine/detail_rendering/detail_rendering.h"
@@ -88,7 +90,72 @@ void copy_vlt_block_params(ShaderMaterial &src, ShaderMaterial &dst) {
 
 } // namespace
 
-void VoxelLodTerrain::ApplyMeshUpdateTask::run(TimeSpreadTaskContext &ctx) {
+// Time-spread task to save meshes in the background on the main thread
+struct SaveMeshesTimeSpreadTask : public zylann::ITimeSpreadTask {
+	SaveMeshesTimeSpreadTask(VoxelLodTerrain *p_parent) : parent(p_parent) {}
+	void run(TimeSpreadTaskContext &ctx) override {
+		parent->_process_save_mesh_jobs(ctx);
+	}
+	VoxelLodTerrain *parent;
+};
+
+void VoxelLodTerrain::_enqueue_save_mesh_job(const SaveMeshJob &job) {
+	_save_mesh_job_queue.push(job);
+	if (!_save_mesh_task_scheduled) {
+		_save_mesh_task_scheduled = true;
+		SaveMeshesTimeSpreadTask *task = ZN_NEW(SaveMeshesTimeSpreadTask)(this);
+		VoxelEngine::get_singleton().push_main_thread_time_spread_task(task);
+	}
+}
+
+void VoxelLodTerrain::_process_save_mesh_jobs(TimeSpreadTaskContext &ctx) {
+	const unsigned int MAX_PER_RUN = 2; // Limit to avoid hitches
+	unsigned int processed = 0;
+
+	while (_save_mesh_job_queue.size() > 0 && processed < MAX_PER_RUN) {
+		const SaveMeshJob job = _save_mesh_job_queue.front();
+		_save_mesh_job_queue.pop();
+
+		// Ensure directory exists
+		const String mesh_dir = job.mesh_path.get_base_dir();
+		if (zylann::godot::check_directory_created(mesh_dir) == OK) {
+			// Save mesh
+			if (_save_meshes_overwrite || !zylann::godot::open_directory(mesh_dir, nullptr).is_valid() ||
+				!zylann::godot::open_directory(mesh_dir, nullptr)->file_exists(job.mesh_path.get_file())) {
+				const Error save_err = zylann::godot::save_resource(job.mesh, job.mesh_path, ResourceSaver::FLAG_NONE);
+				if (save_err != OK) {
+					ZN_PRINT_ERROR(String("Failed to save mesh ") + job.mesh_path + String(" error: ") + String::num_int64(save_err));
+				}
+			}
+
+			// Create a simple scene with a MeshInstance3D to store transform
+			Ref<PackedScene> scene;
+			scene.instantiate();
+			MeshInstance3D *mi = memnew(MeshInstance3D);
+			mi->set_mesh(job.mesh);
+			mi->set_transform(job.transform);
+			const Error pack_result = scene->pack(mi);
+			memdelete(mi);
+			if (pack_result == OK) {
+				const Error save_err = zylann::godot::save_resource(scene, job.scene_path, ResourceSaver::FLAG_NONE);
+				if (save_err != OK) {
+					ZN_PRINT_ERROR(String("Failed to save scene ") + job.scene_path + String(" error: ") + String::num_int64(save_err));
+				}
+			} else {
+				ZN_PRINT_ERROR(String("Failed to pack scene for ") + job.scene_path);
+			}
+		}
+
+		++processed;
+	}
+
+	if (_save_mesh_job_queue.size() > 0) {
+		ctx.postpone = true; // keep the task scheduled
+	} else {
+		_save_mesh_task_scheduled = false;
+	}
+}
+
 	if (!VoxelEngine::get_singleton().is_volume_valid(volume_id)) {
 		// The node can have been destroyed while this task was still pending
 		ZN_PRINT_VERBOSE("Cancelling ApplyMeshUpdateTask, volume_id is invalid");
@@ -3859,6 +3926,20 @@ void VoxelLodTerrain::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("get_lod_fade_duration"), &Self::get_lod_fade_duration);
 	ClassDB::bind_method(D_METHOD("set_lod_fade_duration", "seconds"), &Self::set_lod_fade_duration);
+
+	// Save meshes in editor
+	ClassDB::bind_method(D_METHOD("set_save_meshes_in_editor", "enable"), &Self::set_save_meshes_in_editor);
+	ClassDB::bind_method(D_METHOD("is_saving_meshes_in_editor"), &Self::is_saving_meshes_in_editor);
+
+	ClassDB::bind_method(D_METHOD("set_save_meshes_path", "path"), &Self::set_save_meshes_path);
+	ClassDB::bind_method(D_METHOD("get_save_meshes_path"), &Self::get_save_meshes_path);
+
+	ClassDB::bind_method(D_METHOD("set_save_meshes_overwrite", "enable"), &Self::set_save_meshes_overwrite);
+	ClassDB::bind_method(D_METHOD("is_save_meshes_overwrite"), &Self::is_save_meshes_overwrite);
+
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "save_meshes_in_editor"), "set_save_meshes_in_editor", "is_saving_meshes_in_editor");
+	ADD_PROPERTY(PropertyInfo(Variant::STRING, "save_meshes_path", PROPERTY_HINT_DIR), "set_save_meshes_path", "get_save_meshes_path");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "save_meshes_overwrite"), "set_save_meshes_overwrite", "is_save_meshes_overwrite");
 
 	ClassDB::bind_method(D_METHOD("set_lod_count", "lod_count"), &Self::set_lod_count);
 	ClassDB::bind_method(D_METHOD("get_lod_count"), &Self::get_lod_count);
